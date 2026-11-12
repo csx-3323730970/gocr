@@ -220,7 +220,7 @@ gocr serve  ──► job/worker ──► 同一条 pipeline ──► MySQL
 - `202 Accepted` + `Location` 的异步语义
 - 幂等键 = sha256(repo + diff)，重复提交返回同一 job id，并返回真实状态
 - 队列满 → 429 + `Retry-After`；请求体上限
-- provider 包装顺序：OpenAI → 限流 → 缓存 → 重试
+- provider 包装顺序（由内到外）：OpenAI → 限流 → 缓存 → 重试
 - 优雅停机：停止接收 → 排空 HTTP → 等待 worker
 
 自测：
@@ -261,6 +261,142 @@ gocr serve  ──► job/worker ──► 同一条 pipeline ──► MySQL
 - 哪些测试不需要网络和数据库？哪些必须真实依赖？
 - CI 里 MySQL 服务容器的健康检查为什么先于测试？
 
+## 13. 进阶专题：熔断、TPM、压测与评测门禁（设计讨论，当前未实现）
+
+这一节是「从能跑到生产可用」的差距，也是面试里最容易被追问的部分。**截至当前版本，这些能力尚未实现**，目标是能讲清设计、取舍和落点，而不是背名词。
+
+### 13.1 熔断器（Circuit Breaker）
+
+要解决的问题：供应商持续 429/5xx 时，重试 + 高并发会形成**重试风暴**：每个失败请求又制造更多请求，把等待超时和连接耗尽，故障被放大。
+
+状态机：
+
+```
+closed ──(失败计数/失败率超过阈值)──► open
+  ▲                                     │
+  │                              冷却期（如 30s）
+  │                                     ▼
+  └────(探测成功)──── half-open ◄──(冷却结束，只放一个探测)
+                          │
+                          └──(探测失败)──► open
+```
+
+设计落点（放在 `internal/llm`）：
+
+- 建议 provider 链为：`retry( cache( breaker( rateLimit( openai ) ) ) )`
+  - 熔断器紧贴真实 provider，因此每次重试的失败都会被记账；
+  - 熔断器 open 时快速失败，不经过限流等待；
+  - 缓存命中不经过熔断器（没有真实调用，不应影响状态）。
+- 计数口径要想清楚：5xx / 超时计入失败；429 是否计入要单独决定（它是限流信号，可以计入也可以只做退避）；400/401 是本地配置问题，**不应**让熔断器打开。
+- 半开状态只允许一个探测请求并发通过，否则会瞬间恢复全量流量。
+- open 时返回专门的 `ErrCircuitOpen`，pipeline 将其视为 bundle 失败并降级（当前已有单 bundle 降级逻辑）。
+- 指标：`gocr_circuit_state{provider}`（0 closed / 1 open / 2 half-open）、`gocr_circuit_rejected_total`、`gocr_circuit_transitions_total`。
+
+面试追问：
+
+- 熔断和重试是什么关系？——重试解决瞬时抖动，熔断阻止持续性故障被放大；两者叠加必须防止重试风暴。
+- 连续失败计数和滑动窗口失败率怎么选？——低流量用连续失败，高流量用滑动窗口；要能设置最小请求数避免小样本误判。
+- 半开为什么只放一个探测？——防止恢复瞬间把仍在故障的服务再次打挂。
+
+练习：用 `sync.Mutex` + 可注入的时钟实现状态机；用 httptest 连续返回 500，断言 closed → open → half-open → closed；跑 `go test -race`。
+
+### 13.2 TPM 限流（Tokens Per Minute）
+
+RPM 限制每分钟**请求数**，TPM 限制每分钟 **token 吞吐**（输入 + 输出）。供应商通常两者同时限制，而 token 维度更接近真实成本。
+
+难点：请求发出前不知道输出 token 数。两种可行策略：
+
+1. **预扣估算**：按 prompt 估算输入 token（粗略可用字符数 / 4，中文/代码单独校准），再加上 `max_tokens` 作为预留；请求返回后按真实 usage 校正（多退少补）。
+2. **事后记账**：请求完成后按 usage 扣减，下一次请求前等待额度；实现简单，但可能已经超发。
+
+`golang.org/x/time/rate` 支持 `WaitN(ctx, n)`，可以按 token 数预扣：
+
+```go
+type Limiter struct {
+    rpm *rate.Limiter // 每分钟请求数
+    tpm *rate.Limiter // 每秒 token 数，burst 设为单请求最大 token 或一分钟额度
+}
+
+func (l *Limiter) Wait(ctx context.Context, estTokens int) error {
+    if err := l.rpm.Wait(ctx); err != nil {
+        return err
+    }
+    return l.tpm.WaitN(ctx, estTokens)
+}
+```
+
+注意点：
+
+- `WaitN` 的 n 不能超过 burst；burst 的设置是「最大单请求 token」与「允许的突发额度」之间的取舍。
+- 真实的「预扣 + 校正」需要自己维护差额（reservation/debt），因为 `rate.Limiter` 没有内置退款；也可以在 Agent 层记录实际 usage，用于下一轮估算校准。
+- 当前代码只实现了 RPM（`internal/job/scheduler.go`），以及 per-bundle 的 **总量**预算（`agent.Agent.TokenBudget`）。TPM 是**速率**限制，和预算不是一回事。
+- 指标：`gocr_llm_tokens_total` 已有；新增 `gocr_tpm_wait_seconds` 可观测限流造成的排队时间。
+
+面试追问：
+
+- TPM 和全局 token 预算的区别？——一个是单位时间速率，一个是总量/成本上限。
+- 输出 token 不可知怎么办？——预扣最大输出、事后校正；或接受少量超发。
+- 429 是 RPM 还是 TPM 触发？怎么区分？——看响应头和错误体；无法区分时两者都要限制。
+
+练习：给 Limiter 加 TPM 预扣，Agent 在每次 Complete 前后记录 usage；用假的慢 provider 观察排队与 429 次数变化。
+
+### 13.3 全局 token 预算与降级
+
+现状：`TokenBudget` 是**每个 bundle** 的预算；一个 PR 有多个 bundle 时，总花费仍可能超预期。
+
+全局预算实现思路：
+
+- 进程内 `atomic.Int64 remaining`，所有 bundle 共享；
+- Agent 每轮按 usage 扣减；并发下可用「预留 → 结算」避免超支（先原子扣减估算值，结束后用实际值校正）；
+- 预算低于阈值时按优先级降级：减少 tool 轮次 → 跳过低优先级 bundle → 返回部分结果并标记 `FailedBundles`；
+- 指标：`gocr_budget_remaining`，日志记录降级原因。
+
+面试追问：并发扣预算如何避免超支？降级应该由哪一层决定（pipeline 还是 agent）？预算耗尽时应该报错还是返回部分结果？
+
+### 13.4 压测与 pprof
+
+目标：证明「调度/队列/存储不是瓶颈」，并拿到可写进 README 的数字。
+
+方法：
+
+- 用 fake provider 构造固定延迟（例如 200ms），压测 50/100 个并发 job：观察排队时间、P95 端到端耗时、goroutine 数、内存；
+- `go test -bench` 基准（parser、anchor、pipeline 纯逻辑），`benchstat` 对比优化前后；
+- 通过 `net/http/pprof`（**只开在 debug 端口**）抓 CPU/内存/goroutine：
+  - `go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30`
+  - `go tool pprof -http=:8081 <profile>` 看火焰图；
+- 常见优化点：diff 流式解析（当前是全量读入）、`sync.Pool` 复用缓冲、减少 JSON 序列化、调整 MySQL 连接池、批量插入 findings；
+- 优化数字要注明口径：真实 provider 还是 fake provider、并发数、数据集大小。
+
+面试追问：P95 高怎么定位？内存上涨看什么？怎么证明优化有效（基准 + benchstat + 火焰图）？
+
+### 13.5 评测接入 CI 门禁
+
+问题：评测需要真实模型（成本 + 网络），模型升级后历史 baseline 会漂移，CI 里也不该放长期 key。
+
+可行方案：
+
+1. **录制回放**：按请求内容哈希把 provider 响应存成 fixture（类似 VCR/cassette）；CI 用录制数据跑，完全确定、零成本；定期用真实模型刷新录制。
+2. **阈值门禁**：precision / anchor accuracy / F1 低于 baseline 阈值就 fail；把 `evals/baseline.json` 纳入版本管理。
+3. **统计口径**：按 PR 配对 bootstrap 报置信区间，避免把噪声当成提升；本项目的 runner 目前只输出点估计。
+4. **数据治理**：标注指南、开发集/报告集分离、干净的「无缺陷 PR」假阳性集（前面评测评审里提到过）。
+
+面试追问：如何避免评测过拟合？模型升级怎么回归？离线录制和真实调用的一致性怎么保证？
+
+### 13.6 公网 demo（可选）
+
+- Docker 镜像 + 一台轻量云主机即可；Caddy/Nginx 做 TLS；
+- `/metrics` 接 Prometheus/Grafana 截图放进 README；
+- **不要**在公网暴露无鉴权的提交接口：至少加 token 鉴权 + 请求体上限 + 队列满 429；
+- 诚实说明单机设计的扩展路径：无状态 worker + 外部队列 + 共享 MySQL/PostgreSQL。
+
+### 13.7 建议练习顺序
+
+1. 熔断器（状态机 + 单测 + 指标）
+2. TPM 预扣与 usage 校正（接进 Agent）
+3. 全局预算（原子预留 + 降级）
+4. fake provider 压测 + pprof 优化，产出一组数字
+5. 录制回放 + CI 评测门禁
+
 ## 推荐阅读顺序
 
 第一遍（建立主线）：
@@ -281,4 +417,4 @@ gocr serve  ──► job/worker ──► 同一条 pipeline ──► MySQL
 - 任务：让意见可锚定、可度量，并把它做成可部署的服务。
 - 行动：diff 行号空间 → 锚定纠偏；确定性工程与 agent 分工；bundle 并发；MySQL SKIP LOCKED 队列 + lease；限流/缓存/预算；Prometheus 指标；评测集。
 - 结果：anchor accuracy、precision/recall、token 成本、P95（用你自己的实测数字）。
-- 诚实边界：单机设计；熔断/压测待补；评测门禁需要固定模型与离线录制。
+- 诚实边界：单机设计；熔断/TPM/压测待补；评测门禁需要固定模型与离线录制。进阶设计见第 13 节。

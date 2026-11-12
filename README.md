@@ -99,6 +99,9 @@ curl localhost:8080/v1/reviews/1
 CLI 模式（不需要数据库）：
 
 ```bash
+# 也可以直接安装
+go install github.com/csx-3323730970/gocr/cmd/gocr@latest
+
 export GOCR_API_KEY=sk-...
 
 # 只列文件与分组，不调模型
@@ -146,6 +149,8 @@ make ci             # vet + race + build
 - [ ] 压测 + pprof 优化数字
 - [ ] 评测接入 CI 门禁（需要固定 API key/离线录制）
 - [ ] 公网 demo 部署
+
+进阶概念（熔断状态机、TPM 预扣与校正、全局预算、压测方法、评测门禁）的设计讨论见 [`docs/learning-path.md`](docs/learning-path.md) 第 13 节。
 
 ## 非目标
 
