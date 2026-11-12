@@ -1,0 +1,6 @@
+- 检查 error 是否被忽略或吞掉；必须处理，或显式丢弃并说明原因。
+- 检查 goroutine 泄漏、context 未传递、channel 关闭与阻塞风险。
+- 检查共享数据的并发读写是否加锁（data race）。
+- 检查 nil map / nil slice / nil pointer 解引用。
+- 检查循环内 defer 的资源释放风险。
+- 检查 database/sql、os/exec、文件路径拼接导致的注入或路径穿越。

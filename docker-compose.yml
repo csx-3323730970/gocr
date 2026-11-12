@@ -1,0 +1,34 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gocr
+      MYSQL_USER: gocr
+      MYSQL_PASSWORD: gocr
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      GOCR_DSN: gocr:gocr@tcp(mysql:3306)/gocr?parseTime=true&charset=utf8mb4&loc=Local
+      GOCR_ADDR: ":8080"
+      GOCR_MODEL: ${GOCR_MODEL:-deepseek-chat}
+      GOCR_API_KEY: ${GOCR_API_KEY:-}
+    ports:
+      - "8080:8080"
+    command: ["serve"]
+
+volumes:
+  mysql_data:

@@ -1,0 +1,14 @@
+diff --git a/example/config.go b/example/config.go
+index 1111111..2222222 100644
+--- a/example/config.go
++++ b/example/config.go
+@@ -5,7 +5,4 @@
+ func readConfig(path string) []byte {
+-	data, err := os.ReadFile(path)
+-	if err != nil {
+-		return nil
+-	}
+-	return data
++	data, _ := os.ReadFile(path)
++	return data
+ }

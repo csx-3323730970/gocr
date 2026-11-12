@@ -1,0 +1,17 @@
+provider:
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
+  rpm: 60
+
+review:
+  concurrency: 4
+  max_rounds: 6
+  token_budget: 200000
+  max_file_bytes: 1048576
+  bundle_size: 5
+
+server:
+  addr: ":8080"
+  workers: 2
+  max_queue: 100
+  # dsn is intentionally omitted: pass it via GOCR_DSN so credentials stay out of git.

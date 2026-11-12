@@ -1,0 +1,12 @@
+{
+  "source": "synthetic example (replace with a real PR URL + commit SHA)",
+  "findings": [
+    {
+      "file": "example/config.go",
+      "line": 6,
+      "severity": "major",
+      "category": "ignored-error",
+      "note": "os.ReadFile 的错误被丢弃，调用方无法区分空文件与读取失败"
+    }
+  ]
+}

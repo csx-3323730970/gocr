@@ -1,0 +1,8 @@
+bin/
+dist/
+.env
+.gocr.yaml
+coverage.out
+*.test
+.DS_Store
+Thumbs.db
